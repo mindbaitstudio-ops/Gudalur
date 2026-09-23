@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>3D Open World Multiplayer</title>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: sans-serif; background: #000; }
+    #ui {
+      position: absolute; top: 10px; left: 10px; z-index: 10;
+      color: white; background: rgba(0,0,0,0.7); padding: 12px 16px; border-radius: 8px;
+    }
+    #share-link {
+      color: #00e676; word-break: break-all; font-weight: bold; margin-top: 6px;
+    }
+    #crosshair {
+      position: absolute; top: 50%; left: 50%; width: 8px; height: 8px;
+      background: white; border-radius: 50%; transform: translate(-50%, -50%);
+      pointer-events: none; z-index: 10;
+    }
+  </style>
+  <!-- Three.js for 3D Graphics -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- PeerJS for WebRTC Direct Multiplayer -->
+  <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+</head>
+<body>
+
+  <div id="ui">
+    <div id="status">Status: Initializing...</div>
+    <div id="share-link">Generating link...</div>
+    <p style="font-size: 12px; margin-bottom: 0;">Click screen to lock mouse. Controls: W/A/S/D to Move, Space to Jump.</p>
+  </div>
+  <div id="crosshair"></div>
+
+  <script>
+    // --- 1. SETUP SCENE & CAMERA ---
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb); // Sky blue
+    scene.fog = new THREE.FogExp2(0x87ceeb, 0.015);
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // Lighting
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+    scene.add(ambientLight);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+    dirLight.position.set(50, 100, 50);
+    dirLight.castShadow = true;
+    scene.add(dirLight);
+
+    // --- 2. OPEN WORLD ENVIRONMENT ---
+    // Terrain
+    const groundGeo = new THREE.PlaneGeometry(300, 300);
+    const groundMat = new THREE.MeshStandardMaterial({ color: 0x2e7d32, roughness: 0.8 });
+    const ground = new THREE.Mesh(groundGeo, groundMat);
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Procedural World Elements (Trees & Rocks)
+    function buildWorld() {
+      const treeGeo = new THREE.ConeGeometry(2, 6, 5);
+      const trunkGeo = new THREE.CylinderGeometry(0.4, 0.4, 2);
+      const treeMat = new THREE.MeshStandardMaterial({ color: 0x1b5e20 });
+      const trunkMat = new THREE.MeshStandardMaterial({ color: 0x4e342e });
+
+      for (let i = 0; i < 60; i++) {
+        const x = (Math.random() - 0.5) * 260;
+        const z = (Math.random() - 0.5) * 260;
+        if (Math.abs(x) < 10 && Math.abs(z) < 10) continue; // Keep spawn area clear
+
+        const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+        trunk.position.set(x, 1, z);
+        const foliage = new THREE.Mesh(treeGeo, treeMat);
+        foliage.position.set(x, 4, z);
+
+        scene.add(trunk);
+        scene.add(foliage);
+      }
+    }
+    buildWorld();
+
+    // --- 3. LOCAL PLAYER CONTROLS ---
+    const playerGeo = new THREE.BoxGeometry(1, 2, 1);
+    const playerMat = new THREE.MeshStandardMaterial({ color: 0x1e88e5 });
+    const localPlayerMesh = new THREE.Mesh(playerGeo, playerMat);
+    scene.add(localPlayerMesh);
+
+    camera.position.set(0, 1.6, 0);
+
+    let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
+    let velocityY = 0;
+    const gravity = -20;
+    const speed = 10;
+    let isGrounded = true;
+
+    // First-Person Camera Mouse Look
+    let yaw = 0, pitch = 0;
+    document.body.addEventListener('click', () => {
+      document.body.requestPointerLock();
+    });
+
+    document.addEventListener('mousemove', (e) => {
+      if (document.pointerLockElement === document.body) {
+        yaw -= e.movementX * 0.002;
+        pitch -= e.movementY * 0.002;
+        pitch = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, pitch));
+      }
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.code === 'KeyW') moveForward = true;
+      if (e.code === 'KeyS') moveBackward = true;
+      if (e.code === 'KeyA') moveLeft = true;
+      if (e.code === 'KeyD') moveRight = true;
+      if (e.code === 'Space' && isGrounded) {
+        velocityY = 8;
+        isGrounded = false;
+      }
+    });
+
+    document.addEventListener('keyup', (e) => {
+      if (e.code === 'KeyW') moveForward = false;
+      if (e.code === 'KeyS') moveBackward = false;
+      if (e.code === 'KeyA') moveLeft = false;
+      if (e.code === 'KeyD') moveRight = false;
+    });
+
+    // --- 4. MULTIPLAYER NETWORKING (PEERJS) ---
+    let peer, conn;
+    const otherPlayers = {};
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const targetPeerId = urlParams.get('room');
+
+    const statusEl = document.getElementById('status');
+    const shareLinkEl = document.getElementById('share-link');
+
+    if (targetPeerId) {
+      // CLIENT MODE: Connect to host
+      peer = new Peer();
+      statusEl.innerText = "Status: Connecting to host...";
+      
+      peer.on('open', () => {
+        conn = peer.connect(targetPeerId);
+        setupConnection(conn);
+      });
+    } else {
+      // HOST MODE: Create new session
+      peer = new Peer();
+      peer.on('open', (id) => {
+        statusEl.innerText = "Status: Waiting for friend to join...";
+        const joinUrl = `${window.location.origin}${window.location.pathname}?room=${id}`;
+        shareLinkEl.innerHTML = `Share this link: <a href="${joinUrl}" target="_blank" style="color:#00e676;">${joinUrl}</a>`;
+      });
+
+      peer.on('connection', (c) => {
+        conn = c;
+        setupConnection(conn);
+      });
+    }
+
+    function setupConnection(connection) {
+      statusEl.innerText = "Status: Connected with friend!";
+      
+      // Spawn representation for peer
+      const remoteMat = new THREE.MeshStandardMaterial({ color: 0xe53935 });
+      const remoteMesh = new THREE.Mesh(playerGeo, remoteMat);
+      scene.add(remoteMesh);
+      otherPlayers['friend'] = remoteMesh;
+
+      connection.on('data', (data) => {
+        if (otherPlayers['friend']) {
+          otherPlayers['friend'].position.set(data.x, data.y, data.z);
+          otherPlayers['friend'].rotation.y = data.ry;
+        }
+      });
+
+      connection.on('close', () => {
+        statusEl.innerText = "Status: Friend disconnected.";
+        if (otherPlayers['friend']) scene.remove(otherPlayers['friend']);
+      });
+    }
+
+    // --- 5. GAME LOOP ---
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+      const delta = clock.getDelta();
+
+      // Update Player Physics
+      const moveVector = new THREE.Vector3();
+      if (moveForward) moveVector.z -= 1;
+      if (moveBackward) moveVector.z += 1;
+      if (moveLeft) moveVector.x -= 1;
+      if (moveRight) moveVector.x += 1;
+      moveVector.normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), yaw);
+
+      localPlayerMesh.position.x += moveVector.x * speed * delta;
+      localPlayerMesh.position.z += moveVector.z * speed * delta;
+
+      // Vertical movement & gravity
+      velocityY += gravity * delta;
+      localPlayerMesh.position.y += velocityY * delta;
+
+      if (localPlayerMesh.position.y <= 1) { // 1 unit above terrain (height / 2)
+        localPlayerMesh.position.y = 1;
+        velocityY = 0;
+        isGrounded = true;
+      }
+
+      localPlayerMesh.rotation.y = yaw;
+
+      // Camera sync
+      camera.position.copy(localPlayerMesh.position);
+      camera.position.y += 0.6; // Eye level
+      camera.rotation.set(pitch, yaw, 0, 'YXZ');
+
+      // Network update sync
+      if (conn && conn.open) {
+        conn.send({
+          x: localPlayerMesh.position.x,
+          y: localPlayerMesh.position.y,
+          z: localPlayerMesh.position.z,
+          ry: yaw
+        });
+      }
+
+      renderer.render(scene, camera);
+    }
+
+    animate();
+
+    // Handle Window Resize
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
